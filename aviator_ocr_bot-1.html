@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aviator OCR Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;margin:0;padding:14px}
+main{max-width:720px;margin:auto}.card{background:#1c1c1c;border:1px solid #333;border-radius:16px;padding:15px;margin-bottom:14px}
+h1{font-size:22px;margin:0 0 5px}.muted{color:#aaa;font-size:13px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.stat{background:#292929;border-radius:12px;padding:12px}.big{font-size:26px;font-weight:800}
+button{min-height:46px;border:0;border-radius:11px;padding:10px 15px;margin:6px 5px 0 0;font-weight:700;font-size:15px;cursor:pointer}
+button.primary{background:#fff;color:#111}button.secondary{background:#333;color:#fff}button:disabled{opacity:.45;cursor:not-allowed}
+input{font-size:18px;padding:11px;border-radius:10px;border:1px solid #555;background:#101010;color:#fff;width:120px}
+video{width:100%;height:auto;min-height:210px;object-fit:cover;background:#000;border-radius:12px;display:block}
+.camera{position:relative}.box{position:absolute;left:12%;top:33%;width:76%;height:34%;border:2px dashed #fff;border-radius:10px;pointer-events:none}
+.history{display:flex;flex-wrap:wrap;gap:7px;max-height:180px;overflow:auto}.pill{background:#303030;padding:7px 9px;border-radius:99px;font-size:13px}
+.status{margin-top:9px;line-height:1.4}.good{font-weight:800;font-size:20px}
+@media(max-width:430px){body{padding:10px}.grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<main>
+<div class="card">
+<h1>Aviator Camera Monitor</h1>
+<div class="muted">Camera + automatic OCR multiplier reading + round recording + statistical analysis.</div>
+</div>
+
+<div class="card">
+<div class="camera">
+<video id="video" autoplay playsinline muted></video>
+<div class="box"></div>
+</div>
+<button id="start" class="primary" type="button">Start camera</button>
+<button id="stop" class="secondary" type="button">Stop camera</button>
+<button id="scan" class="secondary" type="button">Scan multiplier</button>
+<div id="status" class="status muted">Press “Start camera”. If the browser asks for permission, choose Allow.</div>
+</div>
+
+<div class="card">
+<div class="muted">Detected multiplier</div>
+<div id="detected" class="big">—</div>
+<div id="confidence" class="muted">No OCR result yet.</div>
+<button id="addDetected" class="primary" type="button">Add detected round</button>
+<div style="margin-top:12px">
+<input id="manual" inputmode="decimal" placeholder="1.55" aria-label="Multiplier">
+<button id="addManual" class="secondary" type="button">Add manually</button>
+</div>
+</div>
+
+<div class="grid">
+<div class="stat"><div class="muted">Rounds</div><div id="count" class="big">0</div></div>
+<div class="stat"><div class="muted">Average</div><div id="avg" class="big">—</div></div>
+<div class="stat"><div class="muted">≤1.50×</div><div id="low" class="big">—</div></div>
+<div class="stat"><div class="muted">5×+</div><div id="high" class="big">—</div></div>
+</div>
+
+<div class="card">
+<div class="muted">Statistical monitor</div>
+<div id="signal" class="good" style="margin-top:7px">WAIT FOR DATA</div>
+<div id="explain" class="muted" style="margin-top:6px">Record at least 5 rounds.</div>
+</div>
+
+<div class="card">
+<div style="font-weight:700">Round history</div>
+<div id="history" class="history" style="margin-top:9px"><span class="muted">No rounds yet.</span></div>
+<button id="clear" class="secondary" type="button">Clear history</button>
+</div>
+
+<div class="card">
+<div style="font-weight:700">Camera note</div>
+<div class="muted" style="margin-top:6px">
+Camera access normally requires a secure website (HTTPS) or localhost. For automatic OCR, keep the CastleBet multiplier large and centered inside the dashed box. OCR needs an internet connection the first time it loads the OCR engine.
+</div>
+</div>
+</main>
+
+<script>
+(function(){
+"use strict";
+
+var rounds = JSON.parse(localStorage.getItem("aviatorRounds") || "[]");
+var stream = null, lastDetected = null, worker = null;
+var autoScanning = false, scanBusy = false, autoTimer = null;
+
+function $(id){ return document.getElementById(id); }
+function status(msg){ $("status").textContent = msg; }
+function valid(v){ return Number.isFinite(v) && v >= 1 && v <= 100000; }
+
+function save(){
+  localStorage.setItem("aviatorRounds", JSON.stringify(rounds));
+}
+
+function addRound(v){
+  if(!valid(v)){
+    status("Enter a valid multiplier such as 1.55.");
+    return;
+  }
+  rounds.push(Number(v));
+  if(rounds.length > 500) rounds.shift();
+  save();
+  $("manual").value = "";
+  lastDetected = null;
+  $("detected").textContent = "—";
+  $("confidence").textContent = "Round recorded.";
+  update();
+  status("Round " + Number(v).toFixed(2) + "× recorded.");
+}
+
+function update(){
+  var n = rounds.length;
+  $("count").textContent = n;
+  $("avg").textContent = n ?
+    (rounds.reduce(function(a,b){return a+b},0)/n).toFixed(2)+"×" : "—";
+
+  var low = rounds.filter(function(x){return x <= 1.5}).length;
+  var high = rounds.filter(function(x){return x >= 5}).length;
+
+  $("low").textContent = n ? low+" ("+Math.round(low/n*100)+"%)" : "—";
+  $("high").textContent = n ? high+" ("+Math.round(high/n*100)+"%)" : "—";
+
+  $("history").innerHTML = n ?
+    rounds.slice().reverse().map(function(x){
+      return '<span class="pill">'+Number(x).toFixed(2)+'×</span>';
+    }).join("") :
+    '<span class="muted">No rounds yet.</span>';
+
+  if(n < 5){
+    $("signal").textContent = "WAIT FOR DATA";
+    $("explain").textContent = "Record at least 5 completed rounds.";
+    return;
+  }
+
+  var r = rounds.slice(-12);
+  var rl = r.filter(function(x){return x <= 1.5}).length;
+  var rh = r.filter(function(x){return x >= 5}).length;
+
+  if(rl >= 7){
+    $("signal").textContent = "LOW-ROUND CLUSTER";
+    $("explain").textContent =
+      "Many recent rounds were ≤1.50×. Descriptive only; it does not mean a high round is due.";
+  } else if(rh >= 3){
+    $("signal").textContent = "HIGH VOLATILITY";
+    $("explain").textContent =
+      "Several recent rounds were 5×+. Previous highs do not make another high round more likely.";
+  } else {
+    $("signal").textContent = "NO STRONG SIGNAL";
+    $("explain").textContent =
+      "The recent sample does not provide a reliable basis for forecasting the next multiplier.";
+  }
+}
+
+async function startCamera(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    status("Camera is unavailable here. Open this page in Chrome using HTTPS.");
+    return;
+  }
+
+  try{
+    if(stream) stream.getTracks().forEach(function(t){t.stop();});
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{
+        facingMode:{ideal:"environment"},
+        width:{ideal:1280},
+        height:{ideal:720}
+      },
+      audio:false
+    });
+
+    $("video").srcObject = stream;
+    await $("video").play();
+    status("Camera is running. Put the CastleBet multiplier inside the dashed box.");
+  }catch(e){
+    status("Camera permission failed. In Chrome, allow Camera access and use an HTTPS page.");
+  }
+}
+
+function stopCamera(){
+  stopAutoScan();
+  if(stream) stream.getTracks().forEach(function(t){t.stop();});
+  stream = null;
+  $("video").srcObject = null;
+  status("Camera stopped.");
+}
+
+function normalizeOCR(s){
+  return String(s || "")
+    .replace(/[Oo]/g,"0")
+    .replace(/[lI|]/g,"1")
+    .replace(/[Ss]/g,"5")
+    .replace(/[Zz]/g,"2")
+    .replace(/[,]/g,".")
+    .replace(/\s+/g," ");
+}
+
+function extractMultiplier(raw){
+  var s = normalizeOCR(raw);
+
+  // Prefer values followed by x / X.
+  var m = s.match(/(\d{1,5}(?:\.\d{1,3})?)\s*[xX]/);
+  if(m) return parseFloat(m[1]);
+
+  // Otherwise find decimal values in a plausible multiplier range.
+  var matches = s.match(/\b\d{1,5}(?:\.\d{1,3})?\b/g) || [];
+  var vals = matches.map(parseFloat).filter(function(v){
+    return valid(v);
+  });
+
+  if(!vals.length) return null;
+
+  // OCR sometimes reads 1.55 as 155. Reject obvious large integer noise
+  // unless it is explicitly followed by x.
+  var decimal = vals.find(function(v){
+    return String(v).indexOf(".") !== -1;
+  });
+
+  return decimal != null ? decimal : vals[0];
+}
+
+async function ensureWorker(){
+  if(worker) return worker;
+
+  if(!window.Tesseract){
+    throw new Error("OCR library could not load. Check your internet connection.");
+  }
+
+  $("ocrStatus").textContent = "Loading OCR engine…";
+  worker = await Tesseract.createWorker("eng", 1, {
+    logger:function(info){
+      if(info.status){
+        var p = info.progress != null ? " " + Math.round(info.progress*100) + "%" : "";
+        $("ocrStatus").textContent = "OCR: " + info.status + p;
+      }
+    }
+  });
+
+  // Restrict recognition to useful characters where supported by Tesseract.
+  try{
+    await worker.setParameters({
+      tessedit_char_whitelist:"0123456789.xX",
+      preserve_interword_spaces:"1"
+    });
+  }catch(e){}
+
+  $("ocrStatus").textContent = "OCR engine ready.";
+  return worker;
+}
+
+function captureCrop(){
+  var video = $("video");
+  var canvas = $("frame");
+
+  if(!video.videoWidth || !video.videoHeight) return null;
+
+  // Match the visible dashed box approximately:
+  // x=12%, y=33%, width=76%, height=34%.
+  var sx = Math.floor(video.videoWidth * 0.12);
+  var sy = Math.floor(video.videoHeight * 0.33);
+  var sw = Math.floor(video.videoWidth * 0.76);
+  var sh = Math.floor(video.videoHeight * 0.34);
+
+  canvas.width = Math.min(sw * 2, 1800);
+  canvas.height = Math.min(sh * 2, 900);
+
+  var ctx = canvas.getContext("2d", {willReadFrequently:true});
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+  return canvas;
+}
+
+async function scanOnce(){
+  if(scanBusy) return;
+  if(!stream || !$("video").videoWidth){
+    status("Start the camera first.");
+    return;
+  }
+
+  scanBusy = true;
+  $("scan").disabled = true;
+  $("ocrStatus").textContent = "Reading multiplier…";
+
+  try{
+    var canvas = captureCrop();
+    if(!canvas) throw new Error("Could not capture camera frame.");
+
+    var w = await ensureWorker();
+    var result = await w.recognize(canvas);
+    var raw = result.data.text || "";
+    var value = extractMultiplier(raw);
+
+    if(value !== null && valid(value)){
+      lastDetected = value;
+      $("detected").textContent = value.toFixed(2) + "×";
+
+      var conf = result.data.confidence;
+      $("confidence").textContent =
+        "OCR confidence: " + (Number.isFinite(conf) ? Math.round(conf) + "%" : "not available");
+
+      status("Detected " + value.toFixed(2) + "×. Check it, then press “Add detected round”.");
+    }else{
+      lastDetected = null;
+      $("detected").textContent = "—";
+      $("confidence").textContent = "No multiplier recognized.";
+      status("No multiplier found. Keep the value inside the dashed box and try again.");
+    }
+  }catch(e){
+    status("OCR error: " + (e && e.message ? e.message : "unknown error"));
+  }finally{
+    scanBusy = false;
+    $("scan").disabled = false;
+  }
+}
+
+function startAutoScan(){
+  if(autoScanning) return;
+  if(!stream){
+    status("Start the camera first.");
+    return;
+  }
+
+  autoScanning = true;
+  $("auto").textContent = "Stop auto-scan";
+  status("Auto-scan is running. OCR will check the dashed box periodically.");
+
+  async function loop(){
+    if(!autoScanning) return;
+    await scanOnce();
+    if(autoScanning) autoTimer = setTimeout(loop, 2200);
+  }
+  loop();
+}
+
+function stopAutoScan(){
+  autoScanning = false;
+  if(autoTimer) clearTimeout(autoTimer);
+  autoTimer = null;
+  $("auto").textContent = "Start auto-scan";
+}
+
+$("start").addEventListener("click", startCamera);
+$("stop").addEventListener("click", stopCamera);
+$("scan").addEventListener("click", scanOnce);
+$("auto").addEventListener("click", function(){
+  if(autoScanning) stopAutoScan();
+  else startAutoScan();
+});
+
+$("addDetected").addEventListener("click", function(){
+  if(lastDetected !== null) addRound(lastDetected);
+  else status("No detected multiplier yet. Scan first or enter the value manually.");
+});
+
+$("addManual").addEventListener("click", function(){
+  var v = parseFloat($("manual").value.replace(",","."));
+  addRound(v);
+});
+
+$("manual").addEventListener("keydown", function(e){
+  if(e.key === "Enter"){
+    e.preventDefault();
+    $("addManual").click();
+  }
+});
+
+$("clear").addEventListener("click", function(){
+  if(confirm("Clear all saved round history?")){
+    rounds = [];
+    save();
+    update();
+    status("History cleared.");
+  }
+});
+
+window.addEventListener("beforeunload", function(){
+  stopCamera();
+  if(worker) worker.terminate();
+});
+
+update();
+})();
+</script>
+</body>
+</html>
